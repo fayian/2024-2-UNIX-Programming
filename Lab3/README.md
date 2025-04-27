@@ -38,7 +38,7 @@ We provide a number of hints for you to solve the challenge. The directions for 
 
 1. Since the `gop_NNN` functions are all implemented in the shared library, it is feasible that you can hijack the function calls from the `main` function to the `gop_NNN` functions by modifying the GOT table of the corresponding functions. For example, making function calls to `gop_1`, `gop_2`, and `gop_3` can be altered and become calling `gop_down`, `gop_fill_1`, and `gop_show`, respectively.
 
-==Note: You are not allowed to hijack `gop_*` functions using `LD_PRELOAD` on the challenge server. Please hijack it using the GOT table.==
+Note: You are not allowed to hijack `gop_*` functions using `LD_PRELOAD` on the challenge server. Please hijack it using the GOT table.
 
 1. Locating the *runtime* address of the GOT table in a running process could be tricky. But since we have provided a special function `game_get_ptr`, you can obtain the real address of the `main` function in runtime. We also provide the binary file of the [`gotoku`](https://up.zoolab.org/unixprog/lab03/gotoku) executable. You should be able to find the relative address of the `main` function and each `GOT` table entry from the binary. The relative addresses can be retrieved by `pwntools` using the script.
 
