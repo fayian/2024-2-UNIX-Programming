@@ -4,8 +4,6 @@
 #include <sys/mman.h>
 #include <stdlib.h>
 
-#include "test.h"
-
 extern void asmSyscallHook();
 extern void syscallAddr(void);
 extern long enterSyscall(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
@@ -171,8 +169,4 @@ void ____asm_impl(void)
 	"addq $136, %rsp \n\t"
 	"jmp syscallAddr \n\t"
 	);
-}
-
-int main() {
-    syscallHook();
 }
