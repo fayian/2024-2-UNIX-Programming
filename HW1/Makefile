@@ -13,6 +13,3 @@ libzpoline.so: libzpoline3.c
 
 logger.so: logger.c
 	gcc -shared -fPIC $(CFLAGS) $< -ldl -o $@
-
-test: libzpoline1.c
-	gcc $(CFLAGS) $< -o $@
