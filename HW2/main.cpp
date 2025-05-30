@@ -306,7 +306,6 @@ public:
         m_load_path = load_path;
         return 0;
     }
-
     int si() {        
         if(ptrace(PTRACE_SINGLESTEP, m_trace_pid, 0, 0) < 0) {
             perror("[ERROR][si] PTRACE_SINGLESTEP");
@@ -334,7 +333,6 @@ public:
 
         return 0;
     }
-
     int cont() {
         if(ptrace(PTRACE_CONT, m_trace_pid, 0, 0) < 0) {
             perror("[ERROR][cont] PTRACE_CONT");
@@ -359,6 +357,21 @@ public:
         disassemble(rip);
         return 0;
     }
+    int info_reg() {
+        user_regs_struct regs;
+        
+        if(ptrace(PTRACE_GETREGS, m_trace_pid, 0, &regs)) {
+            perror("[ERROR][info_reg] PTRACE_GETREGS");
+            return -1;
+        };
+        printf("$rax 0x%016llx\t$rbx 0x%016llx\t$rcx 0x%016llx\n", regs.rax, regs.rbx, regs.rcx);
+        printf("$rdx 0x%016llx\t$rsi 0x%016llx\t$rdi 0x%016llx\n", regs.rdx, regs.rsi, regs.rdi);
+        printf("$rbp 0x%016llx\t$rsp 0x%016llx\t$r8  0x%016llx\n", regs.rbp, regs.rsp, regs.r8);
+        printf("$r9  0x%016llx\t$r10 0x%016llx\t$r11 0x%016llx\n", regs.r9, regs.r10, regs.r11);
+        printf("$r12 0x%016llx\t$r13 0x%016llx\t$r14 0x%016llx\n", regs.r12, regs.r13, regs.r14);
+        printf("$r15 0x%016llx\t$rip 0x%016llx\t$eflags 0x%016llx\n", regs.r15, regs.rip, regs.eflags);
+        return 0;
+    }
 
     void run() {        
         printf("(sdb) ");
@@ -378,6 +391,8 @@ public:
                 if(si() == 1) break;
             } else if(input[0] == "cont") {
                 if(cont() == 1) break;
+            } else if(input[0] == "info" && input[1] == "reg") {
+                info_reg();
             }
 
             printf("(sdb) ");
