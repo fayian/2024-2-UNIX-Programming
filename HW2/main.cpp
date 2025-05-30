@@ -45,18 +45,15 @@ private:
         uint64_t start_addr;
         uint64_t end_addr;
         char line[256];
+        char permission[5];
 
         while (fgets(line, sizeof(line), maps)) {
             // Check if the line contains the binary path
             if (strstr(line, m_load_filename.c_str())) {
-                sscanf(line, "%lx-%lx", &start_addr, &end_addr);
-                if(start_addr <= address && address < end_addr) {
+                sscanf(line, "%lx-%lx %s ", &start_addr, &end_addr, permission);
+                if(start_addr <= address && address < end_addr && permission[2] == 'x') {
                     fclose(maps);
                     return true;
-                }
-                if(address == end_addr) {
-                    fclose(maps);
-                    return false;
                 }
             }
         }
@@ -74,30 +71,75 @@ private:
         return regs.rip;
     }
 
-    // returns disassembled instruction count
-    int disassemble(int instruction_count = 5, uint64_t rip = 0) {
-        cs_insn* instruction;
-        
-
-        // Get RIP
-        if(rip == 0) {
-            rip = get_rip();
+    long get_memory(uint64_t address) {
+        errno = 0;
+        long data = ptrace(PTRACE_PEEKDATA, m_trace_pid, address, NULL);
+        if(errno != 0) {
+            perror("[ERROR][get_memory] PTRACE_PEEKTEXT");
+            return -1;
         }
+        return data;
+    }
+
+    int set_memory(uint64_t address, uint8_t data[8]) {
+        uint64_t data_;
+        memcpy(&data_, data, sizeof(data_));
+        if(ptrace(PTRACE_POKETEXT, m_trace_pid, address, data_) < 0) {
+            perror("[ERROR][set_memory] PTRACE_POKETEXT");
+            return -1;
+        }
+        return 0;
+    }
+
+    //returns the original bit
+    uint8_t set_interrupt(uint64_t address) {
+        uint8_t mem[8];
+
+        long data = get_memory(address);
+        memcpy(mem, &data, sizeof(data));
+
+        uint8_t original = mem[0];
+        mem[0] = 0xCC;
+        set_memory(address, mem);
+
+        return original;
+    }
+
+    void restore_interrupt(uint64_t address, uint8_t original_byte) {
+        uint8_t mem[8];
+
+        long data = get_memory(address);
+        memcpy(mem, &data, sizeof(data));
+
+        mem[0] = original_byte;
+        set_memory(address, mem);
+
+        // RIP -= 1
+        user_regs_struct regs;
+        if (ptrace(PTRACE_GETREGS, m_trace_pid, 0, &regs) < 0) {
+            perror("[ERROR][restore_interrupt] PTRACE_GETREGS");
+            return;
+        }
+        regs.rip -= 1;
+        if (ptrace(PTRACE_SETREGS, m_trace_pid, 0, &regs) < 0) {
+            perror("[ERROR][restore_interrupt] PTRACE_SETREGS");
+        }
+    }
+
+    // returns disassembled instruction count
+    int disassemble(uint64_t rip, int instruction_count = 5) {
+        cs_insn* instruction;
 
         for(int i = 0; i < instruction_count; i++) {
             if(!is_valid_address(rip)) {
+                printf("%lx\n", rip);
                 printf("** the address is out of the range of the executable region.\n");
                 return i;
             }
             
             // Fetch instuction memory
             uint8_t code[16];
-            errno = 0;
-            long data = ptrace(PTRACE_PEEKDATA, m_trace_pid, rip, NULL);
-            if(errno != 0) {
-                perror("[ERROR][dissasemble] PTRACE_PEEKTEXT");
-                return -1;
-            }
+            long data = get_memory(rip);
             memcpy(code, &data, sizeof(data));
 
             data = ptrace(PTRACE_PEEKDATA, m_trace_pid, rip + 8, NULL);
@@ -107,7 +149,6 @@ private:
             }
             memcpy(code + 8, &data, sizeof(data));
             
-
             size_t count = cs_disasm(
                 m_capstone_handle, 
                 code,
@@ -242,8 +283,24 @@ public:
             printf("** program \'%s\' loaded. entry point: %lx.\n", 
                 load_path.c_str(), entry_point);
 
+            // Run until entry point
+            uint8_t original = set_interrupt(entry_point);
+            if(ptrace(PTRACE_CONT, m_trace_pid, 0, 0) < 0) {
+                perror("[ERROR][load] PTRACE_CONT");
+                return -1;
+            }
+            if(waitpid(m_trace_pid, &status, 0) < 0) {
+                perror("[ERROR][load] waitpid");
+                return -1;
+            }
+            if(!WIFSTOPPED(status)) {
+                fprintf(stderr, "[ERROR][load] Something went wrong when continue\n");
+                return -1; 
+            }
+            restore_interrupt(entry_point, original);
+
             // Disassemble
-            disassemble(5, entry_point);
+            disassemble(entry_point);
         }
 
         m_load_path = load_path;
@@ -273,7 +330,7 @@ public:
             //TODO: do the breakpoint stuff
         }
 
-        disassemble();
+        disassemble(rip);
 
         return 0;
     }
@@ -299,7 +356,7 @@ public:
         printf("** hit a breakpoint at 0x%lx.\n", rip);
         //TODO: do the breakpoint stuff
 
-        disassemble(5, rip);
+        disassemble(rip);
         return 0;
     }
 
