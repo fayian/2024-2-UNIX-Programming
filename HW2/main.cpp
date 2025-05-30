@@ -25,6 +25,15 @@ private:
     string m_load_filename;
     csh m_capstone_handle;
     pid_t m_trace_pid;
+    vector<uint64_t> breakpoints;
+
+    bool is_breakpoint(uint64_t address) {
+        if(address == 0) return false;
+        for(const uint64_t bp : breakpoints) {
+            if(bp == address) return true;
+        }
+        return false;
+    }
 
     bool is_valid_address(uint64_t address) {
         FILE* maps = fopen(("/proc/" + std::to_string(m_trace_pid) + "/maps").c_str(), "r");
@@ -56,18 +65,23 @@ private:
         return false;
     }
 
+    uint64_t get_rip() {
+        user_regs_struct regs;
+        if(ptrace(PTRACE_GETREGS, m_trace_pid, 0, &regs)) {
+            perror("[ERROR][get_rip] PTRACE_GETREGS");
+            return -1;
+        };
+        return regs.rip;
+    }
+
     // returns disassembled instruction count
     int disassemble(int instruction_count = 5, uint64_t rip = 0) {
         cs_insn* instruction;
-        user_regs_struct regs;
+        
 
         // Get RIP
         if(rip == 0) {
-            if(ptrace(PTRACE_GETREGS, m_trace_pid, 0, &regs)) {
-                perror("[ERROR][disassemble] PTRACE_GETREGS");
-                return -1;
-            };
-            rip = regs.rip;
+            rip = get_rip();
         }
 
         for(int i = 0; i < instruction_count; i++) {
@@ -236,6 +250,59 @@ public:
         return 0;
     }
 
+    int si() {        
+        if(ptrace(PTRACE_SINGLESTEP, m_trace_pid, 0, 0) < 0) {
+            perror("[ERROR][si] PTRACE_SINGLESTEP");
+            return -1;
+        }
+
+        int status;
+        if(waitpid(m_trace_pid, &status, 0) < 0) {
+            perror("[ERROR][si] waitpid");
+            return -1;
+        }
+        
+        if(!WIFSTOPPED(status)) {
+            printf("** the target program terminated.\n");
+            return 1;
+        }
+
+        uint64_t rip = get_rip();
+        if(is_breakpoint(rip)) {
+            printf("** hit a breakpoint at 0x%lx.\n", rip);
+            //TODO: do the breakpoint stuff
+        }
+
+        disassemble();
+
+        return 0;
+    }
+
+    int cont() {
+        if(ptrace(PTRACE_CONT, m_trace_pid, 0, 0) < 0) {
+            perror("[ERROR][cont] PTRACE_CONT");
+            return -1;
+        }
+
+        int status;
+        if(waitpid(m_trace_pid, &status, 0) < 0) {
+            perror("[ERROR][cont] waitpid");
+            return -1;
+        }
+        
+        if(!WIFSTOPPED(status)) {
+            printf("** the target program terminated.\n");
+            return 1;
+        }
+
+        uint64_t rip = get_rip() - 2;
+        printf("** hit a breakpoint at 0x%lx.\n", rip);
+        //TODO: do the breakpoint stuff
+
+        disassemble(5, rip);
+        return 0;
+    }
+
     void run() {        
         printf("(sdb) ");
 
@@ -250,6 +317,10 @@ public:
                 printf("** please load a program first.\n");
                 printf("(sdb) ");
                 continue;
+            } else if(input[0] == "si") {
+                if(si() == 1) break;
+            } else if(input[0] == "cont") {
+                if(cont() == 1) break;
             }
 
             printf("(sdb) ");
@@ -262,7 +333,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Usage: ./sdb [program]\n");
         exit(1);
     }
-
+    
     Sdb sdb;
     if(argc == 2) 
         sdb.load(argv[1]);
