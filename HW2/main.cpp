@@ -25,11 +25,12 @@ private:
     string m_load_filename;
     csh m_capstone_handle;
     pid_t m_trace_pid;
-    vector<uint64_t> breakpoints;
+    vector<uint64_t> m_breakpoints;
+    vector<uint8_t> m_original_byte;
 
     bool is_breakpoint(uint64_t address) {
         if(address == 0) return false;
-        for(const uint64_t bp : breakpoints) {
+        for(const uint64_t bp : m_breakpoints) {
             if(bp == address) return true;
         }
         return false;
@@ -105,7 +106,7 @@ private:
         return original;
     }
 
-    void restore_interrupt(uint64_t address, uint8_t original_byte) {
+    void restore_interrupt(uint64_t address, uint8_t original_byte, bool decrease_rip) {
         uint8_t mem[8];
 
         long data = get_memory(address);
@@ -115,6 +116,7 @@ private:
         set_memory(address, mem);
 
         // RIP -= 1
+        if(!decrease_rip) return;
         user_regs_struct regs;
         if (ptrace(PTRACE_GETREGS, m_trace_pid, 0, &regs) < 0) {
             perror("[ERROR][restore_interrupt] PTRACE_GETREGS");
@@ -178,7 +180,7 @@ private:
         return instruction_count;
     }
 
-    uint64_t get_entry_point(const string& elf_file_path) {
+    uint64_t get_entry_point(uint64_t type = AT_ENTRY) {
         FILE* file = fopen(("/proc/" + std::to_string(m_trace_pid) + "/auxv").c_str(), "rb");
         if (!file) {
             perror("[ERROR][get_entry_point] fopen");
@@ -187,7 +189,7 @@ private:
     
         Elf64_auxv_t aux;
         while (fread(&aux, sizeof(aux), 1, file) == 1) {
-            if(aux.a_type == AT_ENTRY) {
+            if(aux.a_type == type) {
                 fclose(file);
                 return aux.a_un.a_val;
             }
@@ -221,91 +223,7 @@ private:
 
         return result;
     }
-    
-public:
-    Sdb() {
-        if (cs_open(CS_ARCH_X86, CS_MODE_64, &m_capstone_handle) != CS_ERR_OK) {
-            printf("[Error][Sdb] Failed to initialize Capstone\n");
-            exit(1);
-        }
-    }
-    ~Sdb() {
-        cs_close(&m_capstone_handle);
-    }
-
-    int load(const string& load_path) {
-        pid_t pid = fork();
-        if(pid < 0) {
-            perror("[ERROR][load] fork");
-            return -1;
-        }
-
-        if(pid == 0) {
-            //child
-            if(ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) {
-                perror("[ERROR][load] ptrace");
-                exit(0);
-            }
-            
-            if(execl(load_path.c_str(), load_path.c_str(), NULL) < 0) {
-                perror("[ERROR][load] execl");
-                fprintf(stderr, "%s\n", load_path.c_str());
-                exit(0);
-            }
-        } else {
-            //parent
-            int status;
-            if(waitpid(pid, &status, 0) < 0) {
-                perror("[ERROR][load] waitpid");
-                return -1;
-            }
-
-            //The child didn't send stop signal as it should
-            if(!WIFSTOPPED(status)) {
-                fprintf(stderr, "[ERROR][load] WIFSTOPPED return false\n");
-                return -1; 
-            }
-
-            // Set member pid
-            m_trace_pid = pid;
-
-            // Get filename from filepath
-            size_t pos = -1, next_pos = load_path.find('/');
-            while(next_pos != string::npos) {
-                pos = next_pos;
-                next_pos = load_path.find('/', pos + 1);
-            }
-            m_load_filename = load_path.substr(pos + 1);
-
-            // Get entry point
-            uint64_t entry_point = get_entry_point(load_path);
-            if(entry_point == uint64_t(-1)) return -1;
-            printf("** program \'%s\' loaded. entry point: %lx.\n", 
-                load_path.c_str(), entry_point);
-
-            // Run until entry point
-            uint8_t original = set_interrupt(entry_point);
-            if(ptrace(PTRACE_CONT, m_trace_pid, 0, 0) < 0) {
-                perror("[ERROR][load] PTRACE_CONT");
-                return -1;
-            }
-            if(waitpid(m_trace_pid, &status, 0) < 0) {
-                perror("[ERROR][load] waitpid");
-                return -1;
-            }
-            if(!WIFSTOPPED(status)) {
-                fprintf(stderr, "[ERROR][load] Something went wrong when continue\n");
-                return -1; 
-            }
-            restore_interrupt(entry_point, original);
-
-            // Disassemble
-            disassemble(entry_point);
-        }
-
-        m_load_path = load_path;
-        return 0;
-    }
+   
     int si() {        
         if(ptrace(PTRACE_SINGLESTEP, m_trace_pid, 0, 0) < 0) {
             perror("[ERROR][si] PTRACE_SINGLESTEP");
@@ -372,6 +290,131 @@ public:
         printf("$r15 0x%016llx\t$rip 0x%016llx\t$eflags 0x%016llx\n", regs.r15, regs.rip, regs.eflags);
         return 0;
     }
+    int breakpoint(uint64_t address) {
+        if(!is_valid_address(address)) {
+            printf("** the target address is not valid.\n");
+            return -1;
+        }
+        m_breakpoints.push_back(address);
+        m_original_byte.push_back(set_interrupt(address));
+        printf("** set a breakpoint at 0x%lx.\n", address);
+        return 0;
+    }
+    int breakrva(uint64_t offset) {
+        return breakpoint(offset + get_entry_point(AT_BASE));
+    }
+    void info_break() {
+        bool have_breakpoint = false;
+        for(int i = 0; i < m_breakpoints.size(); i++) {
+            if(m_breakpoints[i] != 0)
+                have_breakpoint = true;
+        }
+
+        if(!have_breakpoint) {
+            printf("** no breakpoints.\n");
+            return;
+        }
+
+        printf("Num\tAddress\n");
+
+        for(int i = 0; i < m_breakpoints.size(); i++) {
+            if(m_breakpoints[i] != 0) {
+                printf("%d\t0x%lx", i, m_breakpoints[i]);
+            }
+        }
+    }
+    void delete_break(int id) {
+        if(id >= m_breakpoint.size() || m_breakpoint[id] == 0) {
+            printf("** breakpoint %d does not exist.\n", id);
+        } else {
+            m_breakpoints[id] = 0;
+            printf("** delete breakpoint %d.\n", id);
+        }
+    }
+public:
+    Sdb() {
+        if (cs_open(CS_ARCH_X86, CS_MODE_64, &m_capstone_handle) != CS_ERR_OK) {
+            printf("[Error][Sdb] Failed to initialize Capstone\n");
+            exit(1);
+        }
+    }
+    ~Sdb() {
+        cs_close(&m_capstone_handle);
+    }
+
+    int load(const string& load_path) {
+        pid_t pid = fork();
+        if(pid < 0) {
+            perror("[ERROR][load] fork");
+            return -1;
+        }
+
+        if(pid == 0) {
+            //child
+            if(ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) {
+                perror("[ERROR][load] ptrace");
+                exit(0);
+            }
+            
+            if(execl(load_path.c_str(), load_path.c_str(), NULL) < 0) {
+                perror("[ERROR][load] execl");
+                fprintf(stderr, "%s\n", load_path.c_str());
+                exit(0);
+            }
+        } else {
+            //parent
+            int status;
+            if(waitpid(pid, &status, 0) < 0) {
+                perror("[ERROR][load] waitpid");
+                return -1;
+            }
+
+            //The child didn't send stop signal as it should
+            if(!WIFSTOPPED(status)) {
+                fprintf(stderr, "[ERROR][load] WIFSTOPPED return false\n");
+                return -1; 
+            }
+
+            // Set member pid
+            m_trace_pid = pid;
+
+            // Get filename from filepath
+            size_t pos = -1, next_pos = load_path.find('/');
+            while(next_pos != string::npos) {
+                pos = next_pos;
+                next_pos = load_path.find('/', pos + 1);
+            }
+            m_load_filename = load_path.substr(pos + 1);
+
+            // Get entry point
+            uint64_t entry_point = get_entry_point();
+            if(entry_point == uint64_t(-1)) return -1;
+            printf("** program \'%s\' loaded. entry point: %lx.\n", 
+                load_path.c_str(), entry_point);
+
+            // Run until entry point
+            uint8_t original = set_interrupt(entry_point);
+            if(ptrace(PTRACE_CONT, m_trace_pid, 0, 0) < 0) {
+                perror("[ERROR][load] PTRACE_CONT");
+                return -1;
+            }
+            if(waitpid(m_trace_pid, &status, 0) < 0) {
+                perror("[ERROR][load] waitpid");
+                return -1;
+            }
+            if(!WIFSTOPPED(status)) {
+                fprintf(stderr, "[ERROR][load] Something went wrong when continue\n");
+                return -1; 
+            }
+            restore_interrupt(entry_point, original, true);
+
+            // Disassemble
+            disassemble(entry_point);
+        }
+
+        m_load_path = load_path;
+        return 0;
+    }
 
     void run() {        
         printf("(sdb) ");
@@ -391,8 +434,18 @@ public:
                 if(si() == 1) break;
             } else if(input[0] == "cont") {
                 if(cont() == 1) break;
-            } else if(input[0] == "info" && input[1] == "reg") {
-                info_reg();
+            } else if(input[0] == "info") {
+                if(input[1] == "reg") {
+                    info_reg();
+                } else if(input[1] == "break") {
+                    info_break();
+                }
+            } else if(input[0] == "break") {
+                breakpoint(std::stoull(input[1], nullptr, 16));
+            } else if(input[0] == "breakrva") {
+                breakrva(std::stoull(input[1], nullptr, 16));
+            } else if(input[0] == "delete") {
+                delete_break(atoi(input[1].c_str()));
             }
 
             printf("(sdb) ");
