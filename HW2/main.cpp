@@ -28,12 +28,13 @@ private:
     vector<uint64_t> m_breakpoints;
     vector<uint8_t> m_original_byte;
 
-    bool is_breakpoint(uint64_t address) {
-        if(address == 0) return false;
-        for(const uint64_t bp : m_breakpoints) {
-            if(bp == address) return true;
+    // return -1 if not, else breakpoint index 
+    int check_breakpoint(uint64_t address) {
+        if(address == 0) return -1;
+        for(size_t i = 0; i < m_breakpoints.size(); i++) {
+            if(m_breakpoints[i] == address) return i;
         }
-        return false;
+        return -1;
     }
 
     bool is_valid_address(uint64_t address) {
@@ -106,7 +107,7 @@ private:
         return original;
     }
 
-    void restore_interrupt(uint64_t address, uint8_t original_byte, bool decrease_rip) {
+    void restore_interrupt(uint64_t address, uint8_t original_byte) {
         uint8_t mem[8];
 
         long data = get_memory(address);
@@ -114,9 +115,9 @@ private:
 
         mem[0] = original_byte;
         set_memory(address, mem);
+    }
 
-        // RIP -= 1
-        if(!decrease_rip) return;
+    void revert_rip() {
         user_regs_struct regs;
         if (ptrace(PTRACE_GETREGS, m_trace_pid, 0, &regs) < 0) {
             perror("[ERROR][restore_interrupt] PTRACE_GETREGS");
@@ -143,13 +144,17 @@ private:
             uint8_t code[16];
             long data = get_memory(rip);
             memcpy(code, &data, sizeof(data));
-
-            data = ptrace(PTRACE_PEEKDATA, m_trace_pid, rip + 8, NULL);
-            if(errno != 0) {
-                perror("[ERROR][dissasemble] PTRACE_PEEKTEXT");
-                return -1;
-            }
+            data = get_memory(rip + 8);
             memcpy(code + 8, &data, sizeof(data));
+
+            // Check for breakpoints to restore
+            for(int i = 0; i < 16; i++) {
+                if(code[i] != 0xCC) continue;
+                for(size_t j = 0; j < m_breakpoints.size(); j++) {
+                    if(rip + i == m_breakpoints[j]) 
+                        code[i] = m_original_byte[j];
+                }
+            }
             
             size_t count = cs_disasm(
                 m_capstone_handle, 
@@ -224,11 +229,19 @@ private:
         return result;
     }
    
-    int si() {        
+    int si() {
+        //Check if start on breakpoint
+        uint64_t rip = get_rip();
+        int breakpoint = check_breakpoint(rip);
+        if(breakpoint != -1) {
+            restore_interrupt(rip, m_original_byte[breakpoint]);
+        }
+
+        // Step
         if(ptrace(PTRACE_SINGLESTEP, m_trace_pid, 0, 0) < 0) {
             perror("[ERROR][si] PTRACE_SINGLESTEP");
             return -1;
-        }
+        }        
 
         int status;
         if(waitpid(m_trace_pid, &status, 0) < 0) {
@@ -241,10 +254,15 @@ private:
             return 1;
         }
 
-        uint64_t rip = get_rip();
-        if(is_breakpoint(rip)) {
+        // Restore breakpoint
+        if(breakpoint != -1) {
+            set_interrupt(rip);
+        }
+
+        // Check if hit breakpoint
+        rip = get_rip();
+        if(check_breakpoint(rip) != -1) {
             printf("** hit a breakpoint at 0x%lx.\n", rip);
-            //TODO: do the breakpoint stuff
         }
 
         disassemble(rip);
@@ -252,26 +270,38 @@ private:
         return 0;
     }
     int cont() {
+        //Check if start on breakpoint
+        uint64_t rip = get_rip();
+        int breakpoint = check_breakpoint(rip);
+        if(breakpoint != -1) {
+            restore_interrupt(rip, m_original_byte[breakpoint]);
+        }
+
         if(ptrace(PTRACE_CONT, m_trace_pid, 0, 0) < 0) {
             perror("[ERROR][cont] PTRACE_CONT");
             return -1;
-        }
+        }        
 
         int status;
         if(waitpid(m_trace_pid, &status, 0) < 0) {
             perror("[ERROR][cont] waitpid");
             return -1;
-        }
+        }        
         
         if(!WIFSTOPPED(status)) {
             printf("** the target program terminated.\n");
             return 1;
         }
 
-        uint64_t rip = get_rip() - 2;
-        printf("** hit a breakpoint at 0x%lx.\n", rip);
-        //TODO: do the breakpoint stuff
+        // Restore breakpoint
+        if(breakpoint != -1) {
+            set_interrupt(rip);
+        }
 
+        revert_rip();
+        rip = get_rip();
+        printf("** hit a breakpoint at 0x%lx.\n", rip);
+        
         disassemble(rip);
         return 0;
     }
@@ -301,11 +331,13 @@ private:
         return 0;
     }
     int breakrva(uint64_t offset) {
-        return breakpoint(offset + get_entry_point(AT_BASE));
+        uint64_t entry = get_entry_point(AT_BASE);
+        if(entry == 0) entry = 0x400000;
+        return breakpoint(offset + entry);
     }
     void info_break() {
         bool have_breakpoint = false;
-        for(int i = 0; i < m_breakpoints.size(); i++) {
+        for(size_t i = 0; i < m_breakpoints.size(); i++) {
             if(m_breakpoints[i] != 0)
                 have_breakpoint = true;
         }
@@ -317,14 +349,14 @@ private:
 
         printf("Num\tAddress\n");
 
-        for(int i = 0; i < m_breakpoints.size(); i++) {
+        for(size_t i = 0; i < m_breakpoints.size(); i++) {
             if(m_breakpoints[i] != 0) {
-                printf("%d\t0x%lx", i, m_breakpoints[i]);
+                printf("%ld\t0x%lx\n", i, m_breakpoints[i]);
             }
         }
     }
     void delete_break(int id) {
-        if(id >= m_breakpoint.size() || m_breakpoint[id] == 0) {
+        if(id >= int(m_breakpoints.size()) || m_breakpoints[id] == 0) {
             printf("** breakpoint %d does not exist.\n", id);
         } else {
             m_breakpoints[id] = 0;
@@ -406,7 +438,8 @@ public:
                 fprintf(stderr, "[ERROR][load] Something went wrong when continue\n");
                 return -1; 
             }
-            restore_interrupt(entry_point, original, true);
+            restore_interrupt(entry_point, original);
+            revert_rip();
 
             // Disassemble
             disassemble(entry_point);
