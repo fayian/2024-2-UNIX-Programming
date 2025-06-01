@@ -2,6 +2,7 @@
 #include <sstream>
 #include <vector>
 
+#include <endian.h>
 #include <errno.h>
 #include <elf.h>
 #include <fcntl.h>
@@ -15,6 +16,7 @@
 
 #include <capstone/capstone.h>
 
+using std::istringstream;
 using std::ostringstream;
 using std::string;
 using std::vector;
@@ -77,7 +79,10 @@ private:
         errno = 0;
         long data = ptrace(PTRACE_PEEKDATA, m_trace_pid, address, NULL);
         if(errno != 0) {
-            perror("[ERROR][get_memory] PTRACE_PEEKTEXT");
+            if(errno == EFAULT || errno == EIO) 
+                printf("** the target address is not valid.\n");
+            else
+                perror("[ERROR][get_memory] PTRACE_PEEKTEXT\n");
             return -1;
         }
         return data;
@@ -87,7 +92,10 @@ private:
         uint64_t data_;
         memcpy(&data_, data, sizeof(data_));
         if(ptrace(PTRACE_POKETEXT, m_trace_pid, address, data_) < 0) {
-            perror("[ERROR][set_memory] PTRACE_POKETEXT");
+            if(errno == EFAULT || errno == EIO) 
+                printf("** the target address is not valid.\n");
+            else
+                perror("[ERROR][set_memory] PTRACE_POKETEXT\n");
             return -1;
         }
         return 0;
@@ -229,7 +237,7 @@ private:
         return result;
     }
    
-    int si() {
+    int si(bool print_disasm = true) {
         //Check if start on breakpoint
         uint64_t rip = get_rip();
         int breakpoint = check_breakpoint(rip);
@@ -265,17 +273,14 @@ private:
             printf("** hit a breakpoint at 0x%lx.\n", rip);
         }
 
-        disassemble(rip);
+        if(print_disasm)
+            disassemble(rip);
 
         return 0;
     }
     int cont() {
-        //Check if start on breakpoint
-        uint64_t rip = get_rip();
-        int breakpoint = check_breakpoint(rip);
-        if(breakpoint != -1) {
-            restore_interrupt(rip, m_original_byte[breakpoint]);
-        }
+        // One step to avoid start on breakpoint
+        si(false);
 
         if(ptrace(PTRACE_CONT, m_trace_pid, 0, 0) < 0) {
             perror("[ERROR][cont] PTRACE_CONT");
@@ -293,13 +298,8 @@ private:
             return 1;
         }
 
-        // Restore breakpoint
-        if(breakpoint != -1) {
-            set_interrupt(rip);
-        }
-
         revert_rip();
-        rip = get_rip();
+        uint64_t rip = get_rip();
         printf("** hit a breakpoint at 0x%lx.\n", rip);
         
         disassemble(rip);
@@ -359,10 +359,70 @@ private:
         if(id >= int(m_breakpoints.size()) || m_breakpoints[id] == 0) {
             printf("** breakpoint %d does not exist.\n", id);
         } else {
+            restore_interrupt(m_breakpoints[id], m_original_byte[id]);
             m_breakpoints[id] = 0;
             printf("** delete breakpoint %d.\n", id);
         }
     }
+    int patch_memory(uint64_t address, const string& hex_data) {
+        char word[17];
+        long data;
+        uint8_t mem_bytes[1024];        
+
+        int offset = 0;
+        if(hex_data[0] == '0' && hex_data[1] == 'x')
+            offset = 2;
+        istringstream input_stream(hex_data.substr(offset));
+        
+        //offset = pad hex_data to align word
+        offset = (8 - ((hex_data.size() - offset) / 2 % 8)) % 8;
+
+        // Setup patch first iteration
+        data = get_memory(address - offset);
+        if(data == -1) return -1; //Check if starting memory is valid
+        memcpy(mem_bytes, &data, sizeof(data));
+
+        input_stream.read(word, (8 - offset) * 2);
+        data = be64toh(std::stoull(word, nullptr, 16));
+        uint8_t tmp[8];
+        memcpy(tmp, &data, sizeof(data));
+        for(int i = offset; i < 8; i++) {
+            mem_bytes[i] = tmp[i];
+        }
+
+        int word_count = 1;
+
+        // Setup patch        
+        while(true) {            
+            input_stream.read(word, 16); word[17] = '\0';
+            if(input_stream.gcount() != 16) break;
+
+            data = be64toh(std::stoull(word, nullptr, 16));
+            memcpy(mem_bytes + word_count * 8, &data, sizeof(data));            
+
+            ++word_count;
+        }
+
+        // Check ending memory
+        if(get_memory(address - offset + 8 * word_count) == -1)
+            return -1;
+
+        // Write patch to memory
+        for(int i = 0; i < word_count; i++) {
+            if(set_memory(address - offset + 8 * i, mem_bytes + 8 * i) == -1)
+                return -1;
+        }
+
+        // Reset breakpoints
+        for(size_t i = 0; i < m_breakpoints.size(); i++) {
+            if(address <= m_breakpoints[i] && m_breakpoints[i] < address + 8 * word_count) {
+                m_original_byte[i] = set_interrupt(address);
+            }
+        }
+        printf("** patch memory at 0x%lx.\n", address);
+        return 0;
+    }
+
 public:
     Sdb() {
         if (cs_open(CS_ARCH_X86, CS_MODE_64, &m_capstone_handle) != CS_ERR_OK) {
@@ -479,6 +539,8 @@ public:
                 breakrva(std::stoull(input[1], nullptr, 16));
             } else if(input[0] == "delete") {
                 delete_break(atoi(input[1].c_str()));
+            } else if(input[0] == "patch") {
+                patch_memory(std::stoull(input[1], nullptr, 16), input[2]);
             }
 
             printf("(sdb) ");
